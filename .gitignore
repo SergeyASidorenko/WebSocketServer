@@ -1,0 +1,5 @@
+*.exe
+*.log
+log/*
+logs/*
+.vscode/*
