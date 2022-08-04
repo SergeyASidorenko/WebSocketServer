@@ -17,12 +17,12 @@ import (
 )
 
 const (
-	ConstFrame byte = 0x0 // 0x0 denotes a continuation frame
-	TextFrame  byte = 0x1 // 0x1 denotes a text frame
-	BinFrame   byte = 0x2 // 0x2 denotes a binary frame
-	CloseFrame byte = 0x8 // 0x8 denotes a Streamection close
-	PingFrame  byte = 0x9 // 0x9 denotes a ping
-	PongFrame  byte = 0xA // 0xA denotes a pong
+	ConstFrame byte = 0x0 // 0x0 обозначает фрейм настроек
+	TextFrame  byte = 0x1 // 0x1 обозначает текстовый фрейм
+	BinFrame   byte = 0x2 // 0x2 обозначает двоичный rame
+	CloseFrame byte = 0x8 // 0x8 обозначание фрейма-сигнала о закрытии подключения одной из сторон
+	PingFrame  byte = 0x9 // 0x9 обозначание фрейма типа Пинг (проверка соединения одной из сторон)
+	PongFrame  byte = 0xA // 0xA обозначание фрейма типа Понг (ответ на фрейм типа Пинг)
 )
 
 // Stream ...
