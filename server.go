@@ -105,7 +105,7 @@ func (s *Stream) Get() (*Message, error) {
 			}
 			isMasked = flags & 0x80
 			if isMasked == 0x0 {
-				return nil, errors.New("the frame is not masked")
+				return nil, errors.New("фрейм сообщения не содержит маски")
 			}
 			// Считываем длину содержимого пакета
 			payLoadLenMarker = flags & 0x7F
@@ -132,16 +132,16 @@ func (s *Stream) Get() (*Message, error) {
 			}
 			keySize, err := s.buf.Read(key)
 			if err != nil || keySize < 4 {
-				return nil, errors.New("error during mask reading")
+				return nil, errors.New("ошибка при чтении маски")
 			}
 			if binary.BigEndian.Uint32(key) == 0 {
-				return nil, errors.New("undefined mask")
+				return nil, errors.New("неизвестный тип маски")
 			}
 			data = make([]byte, payLoadLen)
 			msgWriter := new(bytes.Buffer)
 			realPayLoadLen, err := io.CopyN(msgWriter, s.buf, int64(payLoadLen))
 			if err != nil {
-				return nil, fmt.Errorf("error during data reading, read only %d bytes", realPayLoadLen)
+				return nil, fmt.Errorf("ошибка чтения данных, прочитано только %d байт", realPayLoadLen)
 			}
 			// Перекодировка содержимого пакета
 			for i, b := range msgWriter.Bytes() {
@@ -150,7 +150,6 @@ func (s *Stream) Get() (*Message, error) {
 			m.data = append(m.data, data...)
 		}
 	}
-
 	return m, nil
 }
 
@@ -231,7 +230,9 @@ func BroadCast(m *Message) error {
 	return nil
 }
 
-// NewStream
-func NewStream(c net.Conn) *Stream {
-	return &Stream{buf: bufio.NewReadWriter(bufio.NewReader(c), bufio.NewWriter(c)), c: c}
+// NewStream Подключение нового клиента
+func NewStream(c net.Conn) (*Stream, error) {
+	s := &Stream{buf: bufio.NewReadWriter(bufio.NewReader(c), bufio.NewWriter(c)), c: c}
+	err := s.handShake()
+	return s, err
 }
