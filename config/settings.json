@@ -4,5 +4,6 @@
         "password": "1234",
         "host": "localhost",
         "dbname": "chat"
-    }
+    },
+    "host": "websocket.local"
 }
