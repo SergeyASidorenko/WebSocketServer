@@ -16,6 +16,13 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+// Тип Ошибки
+type Error string
+
+func (e Error) Error() string {
+	return string(e)
+}
+
 const (
 	ConstFrame byte = 0x0 // 0x0 обозначает фрейм настроек
 	TextFrame  byte = 0x1 // 0x1 обозначает текстовый фрейм
@@ -24,61 +31,81 @@ const (
 	PingFrame  byte = 0x9 // 0x9 обозначание фрейма типа Пинг (проверка соединения одной из сторон)
 	PongFrame  byte = 0xA // 0xA обозначание фрейма типа Понг (ответ на фрейм типа Пинг)
 )
+const (
+	ErrNoOutputData Error = "нет данных для отправки"
+)
 
-// Stream ...
+var DefaultFrameSize int = 0x200 // размер фрейма по умолчанию - 512 байт
+
+// Stream Буферизованный ввод-вывод по протоколу WebSockets
 type Stream struct {
 	c   net.Conn
 	buf *bufio.ReadWriter
 }
 
-//  Фрагмент данных протокола WebSockets
+//  Message Фрагмент данных протокола WebSockets
 type Message struct {
-	fin    byte
 	opCode byte
 	data   []byte
 }
 
 //	Encode кодирует фрейм для отправки по сети
 func (m Message) Encode() ([]byte, error) {
+	var frameHeaderSize byte
+	var frameData []byte
 	msgLen := len(m.data)
-	encodedMsg := new(bytes.Buffer)
-
-	// Размер заголовка фрейма с размером сообщения до 125 байт
-	var frameHeaderSize byte = 0x02
-
-	// Размер заголовка фрейма с размером сообщения от 125 до 65535 байт
-	if msgLen > 0x7D && msgLen <= 0xFFFF {
-		frameHeaderSize += 2
-	} else if msgLen > 0xFFFF {
-		frameHeaderSize += 8
-	}
-	frameHeader := make([]byte, frameHeaderSize)
-	// Проставляем в заголовок фрейма требуемый тип фрейма
-	frameHeader[0] = 0x80 | (m.opCode & 0x0F)
-	// Проставляем в заголовок идентификатор диапазона размера данных в
-	// фрейме и фактический размер фрейма в кодировке BigEndian
 	if msgLen == 0 {
-		frameHeader[1] = 0
-		encodedMsg.Write(frameHeader)
-	} else {
-		if msgLen <= 125 {
-			frameHeader[1] = byte(msgLen)
-		} else if msgLen <= 0xFFFF {
-			frameHeader[1] = 126
-			binary.BigEndian.PutUint16(frameHeader[2:], uint16(msgLen))
-		} else if msgLen > 0xFFFF {
-			frameHeader[1] = 127
-			binary.BigEndian.PutUint64(frameHeader[2:], uint64(msgLen))
-		}
-		encodedMsg.Write(frameHeader)
-		encodedMsg.Write(m.data)
+		return nil, ErrNoOutputData
 	}
-	return encodedMsg.Bytes(), nil
+	// создаем продвинутую версию динамического массива
+	// байтов для хранения нашего закодированного сообщения
+	buf := new(bytes.Buffer)
+	totalFrames := msgLen/DefaultFrameSize + 1
+	curFrameNumber := 0
+	for curFrameNumber <= totalFrames {
+		if curFrameNumber == totalFrames {
+			frameData = m.data[curFrameNumber*DefaultFrameSize:]
+		} else {
+			frameData = m.data[curFrameNumber*DefaultFrameSize : (curFrameNumber+1)*DefaultFrameSize]
+		}
+		frameDataSize := len(frameData)
+		// Размер заголовка фрейма с размером сообщения до 125 байт
+		frameHeaderSize = 0x02
+		// Размер заголовка фрейма с размером сообщения от 125 до 65535 байт
+		if frameDataSize > 0x7D && frameDataSize <= 0xFFFF {
+			frameHeaderSize += 2
+		} else if frameDataSize > 0xFFFF {
+			frameHeaderSize += 8
+		}
+		frameHeader := make([]byte, frameHeaderSize)
+		// Проставляем в нужные позиции биты, соответствующие требуемому типу фрейма
+		frameHeader[0] = 0x80 | (m.opCode & 0x0F)
+		// Проставляем в заголовок идентификатор диапазона размера данных в
+		// фрейме и фактический размер фрейма в порядке следования байтов BigEndian
+		if frameDataSize <= 125 {
+			frameHeader[1] = byte(frameDataSize)
+		} else if frameDataSize <= 0xFFFF {
+			frameHeader[1] = 126
+			binary.BigEndian.PutUint16(frameHeader[2:], uint16(frameDataSize))
+		} else if frameDataSize > 0xFFFF {
+			frameHeader[1] = 127
+			binary.BigEndian.PutUint64(frameHeader[2:], uint64(frameDataSize))
+		}
+		buf.Write(frameHeader)
+		buf.Write(frameData)
+		curFrameNumber++
+	}
+
+	return buf.Bytes(), nil
 }
 
-// SendMessage
+// Send отправка фреймами сообщения в поток
 func (s *Stream) Send(m *Message) error {
-	_, err := s.buf.Write(m.data)
+	data, err := m.Encode()
+	if err != nil {
+		return err
+	}
+	_, err = s.buf.Write(data)
 	return err
 }
 
@@ -94,10 +121,10 @@ func (s *Stream) Get() (*Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	m.fin = flags & 0x80
+	finBit := flags & 0x80
 	m.opCode = flags & 0x0F
-	if m.opCode == 0x1 && m.fin == 0x0 {
-		for m.fin == 0x0 {
+	if m.opCode == 0x1 && finBit == 0x0 {
+		for finBit == 0x0 {
 			// Считываем следующий байт
 			flags, err = s.buf.ReadByte()
 			if err != nil {
@@ -162,7 +189,7 @@ func HashPassword(data string) (string, error) {
 	return base64.StdEncoding.EncodeToString(hash), nil
 }
 
-// handShake ...
+// handShake сетевое "рукопожатие" по протоколу WebSockets
 func (s *Stream) handShake() error {
 	_, _, err := s.buf.ReadLine()
 	if err != nil {
@@ -200,25 +227,25 @@ func (s *Stream) handShake() error {
 	return nil
 }
 
-// Ping ...
+// Ping Отправка сообщения типа Пинг
 func (s *Stream) Ping() error {
-	m := &Message{fin: 1, opCode: PingFrame, data: nil}
+	m := &Message{opCode: PingFrame, data: nil}
 	return s.Send(m)
 }
 
-// Pong ...
+// Pong Отправка сообщения типа Понг
 func (s *Stream) Pong() error {
-	m := &Message{fin: 1, opCode: PongFrame, data: nil}
+	m := &Message{opCode: PongFrame, data: nil}
 	return s.Send(m)
 }
 
-// CloseStream ...
+// Close закрытие потока
 func (s *Stream) Close() error {
-	m := &Message{fin: 1, opCode: CloseFrame, data: nil}
+	m := &Message{opCode: CloseFrame, data: nil}
 	return s.Send(m)
 }
 
-// BroadCast
+// BroadCast отправка сообщения всем имеющимся подключениям (широковещательный запрос)
 func BroadCast(m *Message) error {
 	var clients []Stream
 	for _, client := range clients {
@@ -230,7 +257,8 @@ func BroadCast(m *Message) error {
 	return nil
 }
 
-// NewStream Подключение нового клиента
+// NewStream Подключение нового клиента,
+// создание на основе подключения обертки типа Stream
 func NewStream(c net.Conn) (*Stream, error) {
 	s := &Stream{buf: bufio.NewReadWriter(bufio.NewReader(c), bufio.NewWriter(c)), c: c}
 	err := s.handShake()
