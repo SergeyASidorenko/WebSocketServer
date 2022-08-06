@@ -32,10 +32,11 @@ const (
 	PongFrame  byte = 0xA // 0xA обозначание фрейма типа Понг (ответ на фрейм типа Пинг)
 )
 const (
-	ErrNoOutputData Error = "нет данных для отправки"
+	ErrNoOutputData           Error = "нет данных для отправки"
+	InValidControlFrameLength Error = "неверный размер управляющего фрейма"
 )
 
-var DefaultFrameSize int = 0x200 // размер фрейма по умолчанию - 512 байт
+var DefaultFrameMaxSize int = 0x200 // максимальный размер фрейма по умолчанию - 512 байт
 
 // Stream Буферизованный ввод-вывод по протоколу WebSockets
 type Stream struct {
@@ -53,20 +54,27 @@ type Message struct {
 func (m Message) Encode() ([]byte, error) {
 	var frameHeaderSize byte
 	var frameData []byte
-	msgLen := len(m.data)
-	if msgLen == 0 {
+	// Размер данных всего сообщения
+	msgDataLen := len(m.data)
+	if msgDataLen == 0 {
 		return nil, ErrNoOutputData
 	}
-	// создаем продвинутую версию динамического массива
+	// Создаем продвинутую версию динамического массива
 	// байтов для хранения нашего закодированного сообщения
 	buf := new(bytes.Buffer)
-	totalFrames := msgLen/DefaultFrameSize + 1
+	totalFrames := msgDataLen/DefaultFrameMaxSize + 1
 	curFrameNumber := 0
+	// Размер данных во всех типах управляющих фреймов должен быть не более 125 байт
+	if m.opCode == PingFrame || m.opCode == PongFrame || m.opCode == CloseFrame {
+		if totalFrames > 1 {
+			return nil, InValidControlFrameLength
+		}
+	}
 	for curFrameNumber <= totalFrames {
 		if curFrameNumber == totalFrames {
-			frameData = m.data[curFrameNumber*DefaultFrameSize:]
+			frameData = m.data[curFrameNumber*DefaultFrameMaxSize:]
 		} else {
-			frameData = m.data[curFrameNumber*DefaultFrameSize : (curFrameNumber+1)*DefaultFrameSize]
+			frameData = m.data[curFrameNumber*DefaultFrameMaxSize : (curFrameNumber+1)*DefaultFrameMaxSize]
 		}
 		frameDataSize := len(frameData)
 		// Размер заголовка фрейма с размером сообщения до 125 байт
@@ -95,7 +103,6 @@ func (m Message) Encode() ([]byte, error) {
 		buf.Write(frameData)
 		curFrameNumber++
 	}
-
 	return buf.Bytes(), nil
 }
 
@@ -228,18 +235,21 @@ func (s *Stream) handShake() error {
 }
 
 // Ping Отправка сообщения типа Пинг
+// Может быть вставлен между посылками фреймов других сообщений
 func (s *Stream) Ping() error {
 	m := &Message{opCode: PingFrame, data: nil}
 	return s.Send(m)
 }
 
 // Pong Отправка сообщения типа Понг
+// Может быть вставлен между посылками фреймов других сообщений
 func (s *Stream) Pong() error {
 	m := &Message{opCode: PongFrame, data: nil}
 	return s.Send(m)
 }
 
 // Close закрытие потока
+// Может быть вставлен между посылками фреймов других сообщений
 func (s *Stream) Close() error {
 	m := &Message{opCode: CloseFrame, data: nil}
 	return s.Send(m)
