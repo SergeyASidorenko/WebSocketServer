@@ -1,4 +1,4 @@
-package websocket
+package server
 
 import (
 	"bufio"
@@ -34,6 +34,8 @@ const (
 const (
 	ErrNoOutputData           Error = "нет данных для отправки"
 	InValidControlFrameLength Error = "неверный размер управляющего фрейма"
+	ErrClosedConn             Error = "поток завершил работу"
+	ErrNotMaskedFrame         Error = "фрейм сообщения не содержит маски"
 )
 
 var DefaultFrameMaxSize int = 0x200 // максимальный размер фрейма по умолчанию - 512 байт
@@ -42,6 +44,7 @@ var DefaultFrameMaxSize int = 0x200 // максимальный размер ф�
 type Stream struct {
 	c   net.Conn
 	buf *bufio.ReadWriter
+	l   chan<- string
 }
 
 //  Message Фрагмент данных протокола WebSockets
@@ -122,68 +125,75 @@ func (s *Stream) Get() (*Message, error) {
 	var isMasked byte
 	var payLoadLenMarker byte
 	var data []byte
+	var flags byte
+	var finBit byte = 0x0
 	m := new(Message)
 	key := make([]byte, 4)
-	flags, err := s.buf.ReadByte()
+	opCodeflags, err := s.buf.Peek(0x1)
 	if err != nil {
 		return nil, err
 	}
-	finBit := flags & 0x80
-	m.opCode = flags & 0x0F
-	if m.opCode == 0x1 && finBit == 0x0 {
-		for finBit == 0x0 {
-			// Считываем следующий байт
-			flags, err = s.buf.ReadByte()
+	m.opCode = opCodeflags[0] & 0x0F
+	for finBit == 0x0 {
+		// Считываем первую часть флагов фрейма (1 байт)
+		flags, err = s.buf.ReadByte()
+		if err != nil {
+			return nil, err
+		}
+		finBit = flags >> 0x7
+		// Считываем следующий байт
+		flags, err = s.buf.ReadByte()
+
+		if err != nil {
+			return nil, err
+		}
+		isMasked = flags >> 0x7
+		if isMasked == 0x0 {
+			return nil, ErrNotMaskedFrame
+		}
+		// Считываем длину содержимого пакета
+		payLoadLenMarker = flags & 0x7F
+		// Если содержимого нет - выходим из функции
+		if payLoadLenMarker == 0x0 {
+			return nil, nil
+		}
+		payLoadLen = uint64(payLoadLenMarker)
+		if payLoadLenMarker == 126 {
+			buf := make([]byte, 2)
+			_, err = s.buf.Read(buf)
 			if err != nil {
 				return nil, err
 			}
-			isMasked = flags & 0x80
-			if isMasked == 0x0 {
-				return nil, errors.New("фрейм сообщения не содержит маски")
-			}
-			// Считываем длину содержимого пакета
-			payLoadLenMarker = flags & 0x7F
-			// Если содержимого нет - выходим из функции
-			if payLoadLenMarker == 0x0 {
-				return nil, nil
-			}
-			payLoadLen = uint64(payLoadLenMarker)
-			if payLoadLenMarker == 126 {
-				buf := make([]byte, 2)
-				_, err = s.buf.Read(buf)
-				if err != nil {
-					return nil, err
-				}
-				payLoadLen = uint64(binary.BigEndian.Uint16(buf))
-			} else if payLoadLenMarker == 127 {
-				buf := make([]byte, 8)
-				_, err = s.buf.Read(buf)
-				if err != nil {
-					return nil, err
-				}
-				payLoadLen = binary.BigEndian.Uint64(buf)
-
-			}
-			keySize, err := s.buf.Read(key)
-			if err != nil || keySize < 4 {
-				return nil, errors.New("ошибка при чтении маски")
-			}
-			if binary.BigEndian.Uint32(key) == 0 {
-				return nil, errors.New("неизвестный тип маски")
-			}
-			data = make([]byte, payLoadLen)
-			msgWriter := new(bytes.Buffer)
-			realPayLoadLen, err := io.CopyN(msgWriter, s.buf, int64(payLoadLen))
+			payLoadLen = uint64(binary.BigEndian.Uint16(buf))
+		} else if payLoadLenMarker == 127 {
+			buf := make([]byte, 8)
+			_, err = s.buf.Read(buf)
 			if err != nil {
-				return nil, fmt.Errorf("ошибка чтения данных, прочитано только %d байт", realPayLoadLen)
+				return nil, err
 			}
-			// Перекодировка содержимого пакета
-			for i, b := range msgWriter.Bytes() {
-				data[i] = b ^ key[i%4]
-			}
-			m.data = append(m.data, data...)
+			payLoadLen = binary.BigEndian.Uint64(buf)
+
 		}
+		keySize, err := s.buf.Read(key)
+		if err != nil || keySize < 4 {
+			return nil, errors.New("ошибка при чтении маски")
+		}
+		if binary.BigEndian.Uint32(key) == 0 {
+			return nil, errors.New("неизвестный тип маски")
+		}
+		data = make([]byte, payLoadLen)
+		msgWriter := new(bytes.Buffer)
+		realPayLoadLen, err := io.CopyN(msgWriter, s.buf, int64(payLoadLen))
+		if err != nil {
+			return nil, fmt.Errorf("ошибка чтения данных, прочитано только %d байт", realPayLoadLen)
+		}
+		// Перекодировка содержимого пакета
+		for i, b := range msgWriter.Bytes() {
+			data[i] = b ^ key[i%4]
+		}
+		m.data = append(m.data, data...)
 	}
+
 	return m, nil
 }
 
@@ -234,6 +244,39 @@ func (s *Stream) handShake() error {
 	return nil
 }
 
+// Run закрытие потока
+// Может быть вставлен между посылками фреймов других сообщений
+func (s *Stream) Run() {
+	go func() {
+		for {
+			m, err := s.Get()
+			if err != nil {
+				s.l <- err.Error()
+				break
+			}
+			if m.opCode == CloseFrame {
+				err = s.Close()
+				if err != nil {
+					s.l <- err.Error()
+					break
+				}
+			}
+			if m.opCode == PingFrame {
+				err = s.Pong()
+				if err != nil {
+					s.l <- err.Error()
+				}
+			}
+			if m.opCode == TextFrame {
+				err = s.Send(m)
+				if err != nil {
+					s.l <- err.Error()
+				}
+			}
+		}
+	}()
+}
+
 // Ping Отправка сообщения типа Пинг
 // Может быть вставлен между посылками фреймов других сообщений
 func (s *Stream) Ping() error {
@@ -248,11 +291,17 @@ func (s *Stream) Pong() error {
 	return s.Send(m)
 }
 
-// Close закрытие потока
+// SendClose отправка сообщения о закрытии канала
 // Может быть вставлен между посылками фреймов других сообщений
-func (s *Stream) Close() error {
+func (s *Stream) SendClose() error {
 	m := &Message{opCode: CloseFrame, data: nil}
 	return s.Send(m)
+}
+
+// Close закрытие TCP подключения
+// Может быть вставлен между посылками фреймов других сообщений
+func (s *Stream) Close() error {
+	return s.c.Close()
 }
 
 // BroadCast отправка сообщения всем имеющимся подключениям (широковещательный запрос)
@@ -267,10 +316,14 @@ func BroadCast(m *Message) error {
 	return nil
 }
 
-// NewStream Подключение нового клиента,
+// Handle Подключение нового клиента,
 // создание на основе подключения обертки типа Stream
-func NewStream(c net.Conn) (*Stream, error) {
+func Handle(c net.Conn) error {
 	s := &Stream{buf: bufio.NewReadWriter(bufio.NewReader(c), bufio.NewWriter(c)), c: c}
 	err := s.handShake()
-	return s, err
+	if err != nil {
+		return err
+	}
+	s.Run()
+	return nil
 }
