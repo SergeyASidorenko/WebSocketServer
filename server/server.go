@@ -11,9 +11,6 @@ import (
 	"io"
 	"net"
 	"net/textproto"
-
-	_ "github.com/go-sql-driver/mysql"
-	"golang.org/x/crypto/bcrypt"
 )
 
 // Тип Ошибки
@@ -37,14 +34,20 @@ const (
 	ErrClosedConn             Error = "поток завершил работу"
 	ErrNotMaskedFrame         Error = "фрейм сообщения не содержит маски"
 )
+const webSocketMagicString = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 var DefaultFrameMaxSize int = 0x200 // максимальный размер фрейма по умолчанию - 512 байт
 
+// Интерфейс логирования
+type WebSocketLogger interface {
+	Log(string) error
+}
+
 // Stream Буферизованный ввод-вывод по протоколу WebSockets
 type Stream struct {
-	c   net.Conn
-	buf *bufio.ReadWriter
-	l   chan<- string
+	c      net.Conn
+	buf    *bufio.ReadWriter
+	logger WebSocketLogger
 }
 
 //  Message Фрагмент данных протокола WebSockets
@@ -53,11 +56,16 @@ type Message struct {
 	data   []byte
 }
 
+//	GetData получение содержимого сообщения
+func (m Message) GetData() []byte {
+	return m.data
+}
+
 //	Encode кодирует фрейм для отправки по сети
 func (m Message) Encode() ([]byte, error) {
 	var frameHeaderSize byte
 	var frameData []byte
-	// Размер данных всего сообщения
+	// Размер данных сообщения
 	msgDataLen := len(m.data)
 	if msgDataLen == 0 {
 		return nil, ErrNoOutputData
@@ -66,7 +74,7 @@ func (m Message) Encode() ([]byte, error) {
 	// байтов для хранения нашего закодированного сообщения
 	buf := new(bytes.Buffer)
 	totalFrames := msgDataLen/DefaultFrameMaxSize + 1
-	curFrameNumber := 0
+	curFrameNumber := 1
 	// Размер данных во всех типах управляющих фреймов должен быть не более 125 байт
 	if m.opCode == PingFrame || m.opCode == PongFrame || m.opCode == CloseFrame {
 		if totalFrames > 1 {
@@ -75,9 +83,9 @@ func (m Message) Encode() ([]byte, error) {
 	}
 	for curFrameNumber <= totalFrames {
 		if curFrameNumber == totalFrames {
-			frameData = m.data[curFrameNumber*DefaultFrameMaxSize:]
+			frameData = m.data[(curFrameNumber-1)*DefaultFrameMaxSize:]
 		} else {
-			frameData = m.data[curFrameNumber*DefaultFrameMaxSize : (curFrameNumber+1)*DefaultFrameMaxSize]
+			frameData = m.data[(curFrameNumber-1)*DefaultFrameMaxSize : curFrameNumber*DefaultFrameMaxSize]
 		}
 		frameDataSize := len(frameData)
 		// Размер заголовка фрейма с размером сообщения до 125 байт
@@ -116,11 +124,14 @@ func (s *Stream) Send(m *Message) error {
 		return err
 	}
 	_, err = s.buf.Write(data)
-	return err
+	if err != nil {
+		return err
+	}
+	return s.buf.Flush()
 }
 
 //	Decode декодирует полное сообщение, полученное из потока
-func (s *Stream) Get() (*Message, error) {
+func (s *Stream) Decode() (*Message, error) {
 	var payLoadLen uint64
 	var isMasked byte
 	var payLoadLenMarker byte
@@ -193,17 +204,7 @@ func (s *Stream) Get() (*Message, error) {
 		}
 		m.data = append(m.data, data...)
 	}
-
 	return m, nil
-}
-
-// HashPassword
-func HashPassword(data string) (string, error) {
-	hash, err := bcrypt.GenerateFromPassword([]byte(data), bcrypt.DefaultCost)
-	if err != nil {
-		return "", err
-	}
-	return base64.StdEncoding.EncodeToString(hash), nil
 }
 
 // handShake сетевое "рукопожатие" по протоколу WebSockets
@@ -221,19 +222,13 @@ func (s *Stream) handShake() error {
 	if len(secWebSocketKey) == 0 {
 		return nil
 	}
-	UserCreds := httpHeaderMap.Get("Autorization")
-	if len(UserCreds) == 0 {
-		return nil
-	}
-	fmt.Println(UserCreds)
-	const webSocketMagicString = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 	h := sha1.New()
 	h.Write([]byte(secWebSocketKey + webSocketMagicString))
 	bWebSocketAccept := h.Sum([]byte{})
 	webSocketAccept := base64.StdEncoding.EncodeToString(bWebSocketAccept)
 	response := "HTTP/1.1 101 Switching Protocols\r\n"
 	response += "Upgrade: websocket\r\n"
-	response += "Streamection: Upgrade\r\n"
+	response += "Connection: Upgrade\r\n"
 	response += "Sec-WebSocket-Version: 13\r\n"
 	response += "Sec-WebSocket-Accept: %s\r\n\r\n"
 	response = fmt.Sprintf(response, webSocketAccept)
@@ -241,40 +236,44 @@ func (s *Stream) handShake() error {
 	if err != nil {
 		return err
 	}
-	return nil
+	return s.buf.Flush()
 }
 
 // Run закрытие потока
 // Может быть вставлен между посылками фреймов других сообщений
-func (s *Stream) Run() {
+func (s *Stream) Stream() <-chan *Message {
+	ch := make(chan *Message)
 	go func() {
+		defer close(ch)
+		err := s.handShake()
+		if err != nil {
+			s.logger.Log(err.Error())
+			return
+		}
 		for {
-			m, err := s.Get()
+			m, err := s.Decode()
 			if err != nil {
-				s.l <- err.Error()
-				break
-			}
-			if m.opCode == CloseFrame {
-				err = s.Close()
-				if err != nil {
-					s.l <- err.Error()
-					break
-				}
+				s.logger.Log(err.Error())
+				continue
 			}
 			if m.opCode == PingFrame {
 				err = s.Pong()
 				if err != nil {
-					s.l <- err.Error()
+					s.logger.Log(err.Error())
 				}
+				continue
 			}
-			if m.opCode == TextFrame {
-				err = s.Send(m)
+			if m.opCode == CloseFrame {
+				err = s.Close()
 				if err != nil {
-					s.l <- err.Error()
+					s.logger.Log(err.Error())
 				}
+				return
 			}
+			ch <- m
 		}
 	}()
+	return ch
 }
 
 // Ping Отправка сообщения типа Пинг
@@ -299,12 +298,19 @@ func (s *Stream) SendClose() error {
 }
 
 // Close закрытие TCP подключения
-// Может быть вставлен между посылками фреймов других сообщений
+// Если в буфере на запись есть какие-то
+// данные перед закрытие соединения они будут отправлены
 func (s *Stream) Close() error {
+	if s.buf.Writer.Buffered() > 0 {
+		err := s.buf.Flush()
+		if err != nil {
+			return err
+		}
+	}
 	return s.c.Close()
 }
 
-// BroadCast отправка сообщения всем имеющимся подключениям (широковещательный запрос)
+// BroadCast  - отправка сообщения всем имеющимся подключениям (широковещательный запрос)
 func BroadCast(m *Message) error {
 	var clients []Stream
 	for _, client := range clients {
@@ -316,14 +322,7 @@ func BroadCast(m *Message) error {
 	return nil
 }
 
-// Handle Подключение нового клиента,
-// создание на основе подключения обертки типа Stream
-func Handle(c net.Conn) error {
-	s := &Stream{buf: bufio.NewReadWriter(bufio.NewReader(c), bufio.NewWriter(c)), c: c}
-	err := s.handShake()
-	if err != nil {
-		return err
-	}
-	s.Run()
-	return nil
+// CreateStream - создание нового сетевого потока по протоколу WebSockets
+func CreateStream(c net.Conn, logger WebSocketLogger) *Stream {
+	return &Stream{c: c, buf: bufio.NewReadWriter(bufio.NewReader(c), bufio.NewWriter(c)), logger: logger}
 }

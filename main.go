@@ -3,7 +3,7 @@ package main
 import (
 	"log"
 	"net"
-	"websocket/server"
+	"websocket/chat"
 )
 
 func main() {
@@ -16,14 +16,12 @@ func main() {
 	if err != nil {
 		log.Panicf("ошибка: %v", err.Error())
 	}
+	chat := chat.CreateAndRunChat()
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			log.Panicf("ошибка: %v", err.Error())
 		}
-		err = server.Handle(conn)
-		if err != nil {
-			log.Panicf("ошибка: %v", err.Error())
-		}
+		chat.AddClient(conn)
 	}
 }

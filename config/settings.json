@@ -5,5 +5,5 @@
         "host": "localhost",
         "dbname": "chat"
     },
-    "host": "websocket.local"
+    "host": "websocket.server.local:8516"
 }
